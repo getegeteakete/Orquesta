@@ -3,71 +3,45 @@ import Anthropic from "@anthropic-ai/sdk";
 import { FreeeClient } from "@/lib/freee/client";
 import { ToolExecutor } from "@/lib/claude/executor";
 import { FREEE_TOOLS } from "@/lib/claude/tools";
-import { FreeeToken } from "@/lib/freee/types";
 
-const anthropic = new Anthropic({
-  apiKey: process.env.ANTHROPIC_API_KEY!,
-});
+const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY! });
 
-// ==========================================
-// システムプロンプト（AI CFOペルソナ）
-// ==========================================
 const SYSTEM_PROMPT = `あなたは「AI CFO（最高財務責任者）」です。
 freee会計と連携し、経営者・経理担当者の質問に日本語で答えます。
 
-## あなたの役割
-1. **財務分析・可視化**: 損益・BS・キャッシュフローを分析し、グラフ付きで説明
-2. **自動記帳**: 自然言語の指示から仕訳・取引を正確に登録
-3. **書類作成**: 請求書・見積書を作成して下書き保存
-4. **異常検知**: 二重計上・外れ値・税区分ミスを検出
+## 役割
+1. 財務分析・可視化: 損益・BS・キャッシュフローをグラフ付きで分析
+2. 自動記帳: 自然言語の指示から仕訳・取引を正確に登録  
+3. 書類作成: 請求書・見積書を作成して下書き保存
+4. 異常検知: 二重計上・外れ値・消費税区分ミスを検出
 
-## 応答スタイル
-- 数値は必ず「¥X,XXX,XXX」形式でカンマ区切り
-- 重要な数値は **太字** で強調
-- 仕訳登録・請求書作成などの書き込み操作は、実行前に「以下の内容で登録します。よろしいですか？」と確認
-- グラフを生成した場合は数値の解説も加える
-- エラー時はわかりやすく原因と対処法を説明
-
-## 注意事項
-- 書き込み操作（仕訳登録・請求書作成）は確認なしに実行しない
+## スタイル
+- 数値は ¥X,XXX,XXX 形式
+- 書き込み操作の前は必ず内容を確認する
 - 税務・法律の最終判断は専門家に確認するよう案内する
-- 不明な勘定科目名が出た場合は候補を提示する
 
 今日の日付: ${new Date().toLocaleDateString("ja-JP", { year: "numeric", month: "long", day: "numeric" })}`;
 
-// ==========================================
-// チャット API エンドポイント
-// ==========================================
+const WRITE_OPERATIONS = ["create_expense_journal", "register_invoice_as_payable", "create_invoice_draft"];
+
 export async function POST(req: NextRequest) {
   try {
-    const body = await req.json();
-    const { messages, token } = body as {
-      messages: Anthropic.MessageParam[];
-      token: FreeeToken;
-    };
-
-    if (!token?.access_token) {
+    // トークンはCookieからのみ取得（フロントエンドに渡さない）
+    const tokenCookie = req.cookies.get("freee_token")?.value;
+    if (!tokenCookie) {
       return NextResponse.json({ error: "freee認証が必要です" }, { status: 401 });
     }
+    const token = JSON.parse(tokenCookie);
 
-    // freeeクライアント・ツール実行エンジン初期化
+    const { messages, confirmed } = await req.json();
     const freeeClient = new FreeeClient(token);
     const executor = new ToolExecutor(freeeClient);
 
-    // 書き込み操作確認フラグ（フロント側で管理）
-    const requiresConfirmation = body.requiresConfirmation ?? true;
-
-    // ==========================================
-    // Agentic Loop: Claude ↔ freee API
-    // ==========================================
-    const responseMessages: any[] = [];
     let currentMessages = [...messages];
-    let iterationCount = 0;
-    const MAX_ITERATIONS = 10;
+    const allCharts: any[] = [];
+    let finalText = "";
 
-    while (iterationCount < MAX_ITERATIONS) {
-      iterationCount++;
-
+    for (let i = 0; i < 10; i++) {
       const response = await anthropic.messages.create({
         model: "claude-sonnet-4-20250514",
         max_tokens: 4096,
@@ -76,29 +50,21 @@ export async function POST(req: NextRequest) {
         messages: currentMessages,
       });
 
-      // ツール使用なし → 最終回答
       if (response.stop_reason === "end_turn") {
-        const textContent = response.content
-          .filter((c) => c.type === "text")
-          .map((c) => (c as Anthropic.TextBlock).text)
-          .join("");
-
-        responseMessages.push({ role: "assistant", content: textContent });
+        finalText = response.content
+          .filter((c): c is Anthropic.TextBlock => c.type === "text")
+          .map((c) => c.text).join("");
         break;
       }
 
-      // ツール使用あり → 実行
       if (response.stop_reason === "tool_use") {
         const toolUseBlocks = response.content.filter(
           (c): c is Anthropic.ToolUseBlock => c.type === "tool_use"
         );
 
-        // 書き込み操作チェック
-        const WRITE_OPERATIONS = ["create_expense_journal", "register_invoice_as_payable", "create_invoice_draft"];
+        // 書き込み操作は確認が必要
         const writeOps = toolUseBlocks.filter((t) => WRITE_OPERATIONS.includes(t.name));
-
-        if (requiresConfirmation && writeOps.length > 0 && !body.confirmed) {
-          // 確認が必要な操作の場合、フロントに確認を求める
+        if (writeOps.length > 0 && !confirmed) {
           return NextResponse.json({
             type: "confirmation_required",
             operations: writeOps.map((op) => ({
@@ -106,21 +72,13 @@ export async function POST(req: NextRequest) {
               input: op.input,
               label: getOperationLabel(op.name, op.input),
             })),
-            pendingMessages: currentMessages,
-            pendingResponse: response.content,
           });
         }
 
-        // ツール実行
         const toolResults: Anthropic.ToolResultBlockParam[] = [];
-        const charts: any[] = [];
-
         for (const toolUse of toolUseBlocks) {
-          console.log(`[Chat API] Executing tool: ${toolUse.name}`, toolUse.input);
           const result = await executor.execute(toolUse.name, toolUse.input);
-
-          if (result.chart) charts.push(result.chart);
-
+          if (result.chart) allCharts.push(result.chart);
           toolResults.push({
             type: "tool_result",
             tool_use_id: toolUse.id,
@@ -128,49 +86,21 @@ export async function POST(req: NextRequest) {
           });
         }
 
-        // メッセージ更新
         currentMessages = [
           ...currentMessages,
           { role: "assistant", content: response.content },
           { role: "user", content: toolResults },
         ];
-
-        // チャートデータを追記してストリーム
-        if (charts.length > 0) {
-          responseMessages.push({ type: "charts", charts });
-        }
-
-        continue;
       }
-
-      break;
     }
 
-    // 最終テキスト抽出
-    const finalText = responseMessages
-      .filter((m) => m.role === "assistant")
-      .map((m) => m.content)
-      .join("\n");
-
-    const allCharts = responseMessages
-      .filter((m) => m.type === "charts")
-      .flatMap((m) => m.charts);
-
-    return NextResponse.json({
-      type: "response",
-      message: finalText,
-      charts: allCharts,
-    });
+    return NextResponse.json({ type: "response", message: finalText, charts: allCharts });
   } catch (err: any) {
     console.error("[Chat API Error]", err);
-    return NextResponse.json(
-      { error: err.message || "内部エラーが発生しました" },
-      { status: 500 }
-    );
+    return NextResponse.json({ error: err.message || "内部エラー" }, { status: 500 });
   }
 }
 
-// 書き込み操作の説明文生成
 function getOperationLabel(toolName: string, input: any): string {
   switch (toolName) {
     case "create_expense_journal":
